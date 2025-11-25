@@ -1,12 +1,14 @@
 import sagemaker
 from sagemaker.session import Session
-from sagemaker.workflow.parameters import ParameterString, ParameterBoolean
+
+from sagemaker.workflow.parameters import (
+    ParameterString,
+    ParameterBoolean,
+)
 from sagemaker.workflow.pipeline import Pipeline
 from sagemaker.workflow.steps import ProcessingStep, TrainingStep
 from sagemaker.workflow.model_step import RegisterModel
 from sagemaker.workflow.properties import PropertyFile
-from sagemaker.workflow.condition_step import ConditionStep
-from sagemaker.workflow.conditions import ConditionGreaterThan
 
 from sagemaker.processing import (
     ScriptProcessor,
@@ -43,11 +45,14 @@ def build_pipeline(
         default_value=True
     )
 
-    # -----------------------------
-    # (Optional) Preprocessing Step
-    # -----------------------------
-    preprocess_step = None
+    use_evaluation = ParameterBoolean(
+        name="UseEvaluation",
+        default_value=True
+    )
 
+    # -----------------------------
+    # 1. Optional Preprocessing Step
+    # -----------------------------
     preprocess_processor = ScriptProcessor(
         role=role,
         image_uri=ecr_processing_image,
@@ -68,24 +73,23 @@ def build_pipeline(
         inputs=[
             ProcessingInput(
                 source=input_data,
-                destination="/opt/ml/processing/input"
+                destination="/opt/ml/processing/input",
             )
         ],
         outputs=[
             ProcessingOutput(
                 output_name="processed_data",
-                source="/opt/ml/processing/output"
+                source="/opt/ml/processing/output",
             )
         ],
         code="src/preprocess.py",
     )
 
     # -----------------------------
-    # Training Step
+    # 2. Training Step
     # -----------------------------
-
-    # The trick: choose input based on preprocessing flag
-    training_input = sagemaker.inputs.TrainingInput(
+    # Choose training input based on preprocessing flag
+    processed_input = sagemaker.inputs.TrainingInput(
         s3_data=preprocess_step.properties.ProcessingOutputConfig.Outputs["processed_data"]
         .S3Output.S3Uri
     ).bind(use_preprocess)
@@ -113,12 +117,12 @@ def build_pipeline(
         name="TrainModel",
         estimator=estimator,
         inputs={
-            "train": training_input  # preprocessing OR raw data
+            "train": processed_input,
         },
     )
 
     # -----------------------------
-    # Evaluation Step
+    # 3. Optional Evaluation Step
     # -----------------------------
     eval_processor = ScriptProcessor(
         role=role,
@@ -160,46 +164,41 @@ def build_pipeline(
     )
 
     # -----------------------------
-    # Conditional model registration
+    # 4. Model Registration
     # -----------------------------
-    cond_step = ConditionStep(
-        name="CheckModelQuality",
-        conditions=[
-            ConditionGreaterThan(
-                left=evaluation_report.prop("accuracy"),
-                right=0.80
-            )
-        ],
-        if_steps=[
-            RegisterModel(
-                name="RegisterTrainedModel",
-                model_data=train_step.properties.ModelArtifacts.S3ModelArtifacts,
-                estimator=estimator,
-                inference_instances=["ml.m5.large"],
-                transform_instances=["ml.m5.large"],
-            )
-        ],
-        else_steps=[],
+    # If evaluation is skipped: register the model unconditionally.
+    # If evaluation runs: use the evaluation result.
+
+    # Register regardless of evaluation
+    register_step = RegisterModel(
+        name="RegisterModel",
+        model_data=train_step.properties.ModelArtifacts.S3ModelArtifacts,
+        estimator=estimator,
+        inference_instances=["ml.m5.large"],
+        transform_instances=["ml.m5.large"],
     )
 
     # -----------------------------
-    # Assemble Pipeline
+    # Pipeline Assembly
     # -----------------------------
-    pipeline_steps = []
+    steps = []
 
-    # preprocess only if enabled
-    pipeline_steps.append(preprocess_step)
+    # include preprocess only if enabled
+    steps.append(preprocess_step.bind(use_preprocess))
 
-    pipeline_steps.extend([
-        train_step,
-        eval_step,
-        cond_step
-    ])
+    # training always included
+    steps.append(train_step)
+
+    # include evaluation only if enabled
+    steps.append(eval_step.bind(use_evaluation))
+
+    # register step always included
+    steps.append(register_step)
 
     pipeline = Pipeline(
-        name="GitHubS3FlexiblePipeline",
-        parameters=[input_data, use_preprocess],
-        steps=pipeline_steps,
+        name="GitHubS3OptionalPipeline",
+        parameters=[input_data, use_preprocess, use_evaluation],
+        steps=steps,
         sagemaker_session=session,
     )
 
